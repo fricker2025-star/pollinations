@@ -71,6 +71,7 @@ type RequestTrackingData = {
     modelPriceDefinition: PriceDefinition;
     streamRequested: boolean;
     referrerData: ReferrerData;
+    promptTokensEstimated: number;
 };
 
 type ResponseTrackingData = {
@@ -328,7 +329,36 @@ async function trackRequest(
             `Failed to get price definition for model: ${resolvedModelRequested}`,
         );
     }
-    const streamRequested = await extractStreamRequested(request);
+
+    let streamRequested = false;
+    let promptTokensEstimated = 0;
+
+    try {
+        if (request.method === "GET") {
+            const stream = request.query("stream");
+            streamRequested = z.safeParse(z.coerce.boolean(), stream).data || false;
+            const prompt = request.param("prompt");
+            if (prompt) {
+                promptTokensEstimated = Math.ceil(prompt.length / 4);
+            }
+        } else if (request.method === "POST") {
+            const body = await request.json();
+            streamRequested = z.safeParse(z.coerce.boolean(), body.stream).data || false;
+            if (body.messages && Array.isArray(body.messages)) {
+                const content = body.messages
+                    .map((m: any) =>
+                        typeof m.content === "string"
+                            ? m.content
+                            : JSON.stringify(m.content),
+                    )
+                    .join("");
+                promptTokensEstimated = Math.ceil(content.length / 4);
+            }
+        }
+    } catch (e) {
+        // Ignore errors if body is not JSON or not available
+    }
+
     const referrerData = extractReferrerHeader(request);
 
     return {
@@ -338,6 +368,7 @@ async function trackRequest(
         modelPriceDefinition,
         streamRequested,
         referrerData,
+        promptTokensEstimated,
     };
 }
 
@@ -378,12 +409,28 @@ async function trackResponse(
             };
         }
     }
-    const { modelUsage, contentFilterResults } =
+    let { modelUsage, contentFilterResults } =
         await extractUsageAndContentFilterResults(
             eventType,
             requestTracking,
             response,
         );
+
+    // Fallback billing for streaming disconnects
+    if (!modelUsage && eventType === "generate.text") {
+        log.warn(
+            "Usage missing for text generation, using estimated prompt tokens",
+        );
+        modelUsage = {
+            model: resolvedModelRequested as ModelId,
+            usage: {
+                prompt_tokens: requestTracking.promptTokensEstimated,
+                completion_tokens: 0,
+                total_tokens: requestTracking.promptTokensEstimated,
+            },
+        };
+    }
+
     if (!modelUsage) {
         log.error("Failed to extract model usage");
         return {
@@ -569,18 +616,6 @@ function createTrackingEvent({
         ...responseTracking.contentFilterResults,
         ...errorTracking,
     };
-}
-
-async function extractStreamRequested(request: HonoRequest): Promise<boolean> {
-    if (request.method === "GET") {
-        const stream = request.param("stream");
-        return z.safeParse(z.coerce.boolean(), stream).data || false;
-    }
-    if (request.method === "POST") {
-        const stream = (await request.json()).stream;
-        return z.safeParse(z.coerce.boolean(), stream).data || false;
-    }
-    return false;
 }
 
 function extractUsageHeaders(response: Response): ModelUsage {
